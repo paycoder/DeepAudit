@@ -6,6 +6,9 @@
 
 import json
 import uuid
+import ipaddress
+import socket
+from urllib.parse import urlparse
 from typing import Any, Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -19,6 +22,62 @@ from app.models.user_config import UserConfig
 from app.core.config import settings
 
 router = APIRouter()
+
+
+# SSRF防护：定义内网IP范围
+INTERNAL_IP_RANGES = [
+    ipaddress.ip_network('127.0.0.0/8'),      # Loopback
+    ipaddress.ip_network('10.0.0.0/8'),       # Private Class A
+    ipaddress.ip_network('172.16.0.0/12'),    # Private Class B
+    ipaddress.ip_network('192.168.0.0/16'),   # Private Class C
+    ipaddress.ip_network('169.254.0.0/16'),   # Link-local
+    ipaddress.ip_network('::1/128'),          # IPv6 loopback
+    ipaddress.ip_network('fc00::/7'),         # IPv6 unique local
+    ipaddress.ip_network('fe80::/10'),        # IPv6 link-local
+]
+
+
+def is_safe_url(url: str) -> bool:
+    """验证URL是否安全，防止SSRF攻击"""
+    if not url:
+        return True
+
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return True
+
+        # 阻止localhost和常见的本地地址
+        if hostname.lower() in ['localhost', '0.0.0.0', '0', 'broadcasthost']:
+            return False
+
+        # 尝试解析为IP地址
+        try:
+            ip = ipaddress.ip_address(hostname)
+            # 检查是否为内网IP
+            for network in INTERNAL_IP_RANGES:
+                if ip in network:
+                    return False
+            return True
+        except ValueError:
+            # 不是IP地址，是域名，需要解析
+            try:
+                # 解析域名获取IP地址
+                resolved_ip = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(resolved_ip)
+                # 检查解析后的IP是否为内网IP
+                for network in INTERNAL_IP_RANGES:
+                    if ip in network:
+                        return False
+                return True
+            except (socket.gaierror, ValueError):
+                # 域名解析失败，拒绝访问
+                return False
+    except Exception:
+        # 解析URL失败，拒绝访问
+        return False
 
 
 # ============ Schemas ============
@@ -300,6 +359,14 @@ async def update_config(
     if config.provider not in provider_ids:
         raise HTTPException(status_code=400, detail=f"不支持的提供商: {config.provider}")
 
+    # SSRF防护：验证base_url是否安全
+    if config.base_url and not is_safe_url(config.base_url):
+        print(f"[Embedding Config] SSRF防护: 拒绝保存内网地址 {config.base_url}")
+        raise HTTPException(
+            status_code=400,
+            detail="不允许使用内网地址，请使用公网API地址"
+        )
+
     # 获取提供商信息（用于检查 API Key 要求）
     provider = next((p for p in EMBEDDING_PROVIDERS if p.id == config.provider), None)
     # 注意：不再强制验证模型名称，允许用户输入自定义模型
@@ -323,13 +390,21 @@ async def test_embedding(
     测试嵌入模型配置
     """
     import time
-    
+
+    # SSRF防护：验证base_url是否安全
+    if request.base_url and not is_safe_url(request.base_url):
+        print(f"[Embedding Test] SSRF防护: 拒绝访问内网地址 {request.base_url}")
+        return TestEmbeddingResponse(
+            success=False,
+            message="不允许访问内网地址，请使用公网API地址",
+        )
+
     try:
         start_time = time.time()
-        
+
         # 创建临时嵌入服务
         from app.services.rag.embeddings import EmbeddingService
-        
+
         service = EmbeddingService(
             provider=request.provider,
             model=request.model,
@@ -337,12 +412,12 @@ async def test_embedding(
             base_url=request.base_url,
             cache_enabled=False,
         )
-        
+
         # 执行嵌入
         embedding = await service.embed(request.test_text)
-        
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
+
         return TestEmbeddingResponse(
             success=True,
             message=f"嵌入成功! 维度: {len(embedding)}",
@@ -350,7 +425,7 @@ async def test_embedding(
             sample_embedding=embedding[:5],  # 返回前 5 维
             latency_ms=latency_ms,
         )
-        
+
     except Exception as e:
         return TestEmbeddingResponse(
             success=False,

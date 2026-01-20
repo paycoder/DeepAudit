@@ -8,6 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from pydantic import BaseModel
 import json
+import ipaddress
+import socket
+from urllib.parse import urlparse
 
 from app.api import deps
 from app.db.session import get_db
@@ -43,6 +46,62 @@ def decrypt_config(config: dict, sensitive_fields: list) -> dict:
         if field in decrypted and decrypted[field]:
             decrypted[field] = decrypt_sensitive_data(decrypted[field])
     return decrypted
+
+
+# SSRF防护：定义内网IP范围
+INTERNAL_IP_RANGES = [
+    ipaddress.ip_network('127.0.0.0/8'),      # Loopback
+    ipaddress.ip_network('10.0.0.0/8'),       # Private Class A
+    ipaddress.ip_network('172.16.0.0/12'),    # Private Class B
+    ipaddress.ip_network('192.168.0.0/16'),   # Private Class C
+    ipaddress.ip_network('169.254.0.0/16'),   # Link-local
+    ipaddress.ip_network('::1/128'),          # IPv6 loopback
+    ipaddress.ip_network('fc00::/7'),         # IPv6 unique local
+    ipaddress.ip_network('fe80::/10'),        # IPv6 link-local
+]
+
+
+def is_safe_url(url: str) -> bool:
+    """验证URL是否安全，防止SSRF攻击"""
+    if not url:
+        return True
+
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return True
+
+        # 阻止localhost和常见的本地地址
+        if hostname.lower() in ['localhost', '0.0.0.0', '0', 'broadcasthost']:
+            return False
+
+        # 尝试解析为IP地址
+        try:
+            ip = ipaddress.ip_address(hostname)
+            # 检查是否为内网IP
+            for network in INTERNAL_IP_RANGES:
+                if ip in network:
+                    return False
+            return True
+        except ValueError:
+            # 不是IP地址，是域名，需要解析
+            try:
+                # 解析域名获取IP地址
+                resolved_ip = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(resolved_ip)
+                # 检查解析后的IP是否为内网IP
+                for network in INTERNAL_IP_RANGES:
+                    if ip in network:
+                        return False
+                return True
+            except (socket.gaierror, ValueError):
+                # 域名解析失败，拒绝访问
+                return False
+    except Exception:
+        # 解析URL失败，拒绝访问
+        return False
 
 
 class LLMConfigSchema(BaseModel):
@@ -198,19 +257,34 @@ async def update_my_config(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """更新当前用户的配置"""
+    # SSRF防护：验证llmBaseUrl和ollamaBaseUrl是否安全
+    if config_in.llmConfig:
+        if config_in.llmConfig.llmBaseUrl and not is_safe_url(config_in.llmConfig.llmBaseUrl):
+            print(f"[Config] SSRF防护: 拒绝保存内网地址 {config_in.llmConfig.llmBaseUrl}")
+            raise HTTPException(
+                status_code=400,
+                detail="不允许使用内网地址作为 LLM Base URL，请使用公网API地址"
+            )
+        if config_in.llmConfig.ollamaBaseUrl and not is_safe_url(config_in.llmConfig.ollamaBaseUrl):
+            print(f"[Config] SSRF防护: 拒绝保存内网地址 {config_in.llmConfig.ollamaBaseUrl}")
+            raise HTTPException(
+                status_code=400,
+                detail="不允许使用内网地址作为 Ollama Base URL，请使用公网API地址"
+            )
+
     result = await db.execute(
         select(UserConfig).where(UserConfig.user_id == current_user.id)
     )
     config = result.scalar_one_or_none()
-    
+
     # 准备要保存的配置数据（加密敏感字段）
     llm_data = config_in.llmConfig.dict(exclude_none=True) if config_in.llmConfig else {}
     other_data = config_in.otherConfig.dict(exclude_none=True) if config_in.otherConfig else {}
-    
+
     # 加密敏感字段
     llm_data_encrypted = encrypt_config(llm_data, SENSITIVE_LLM_FIELDS)
     other_data_encrypted = encrypt_config(other_data, SENSITIVE_OTHER_FIELDS)
-    
+
     if not config:
         # 创建新配置
         config = UserConfig(
@@ -227,29 +301,29 @@ async def update_my_config(
             existing_llm = decrypt_config(existing_llm, SENSITIVE_LLM_FIELDS)
             existing_llm.update(llm_data)  # 使用未加密的新数据合并
             config.llm_config = json.dumps(encrypt_config(existing_llm, SENSITIVE_LLM_FIELDS))
-        
+
         if config_in.otherConfig:
             existing_other = json.loads(config.other_config) if config.other_config else {}
             # 先解密现有数据，再合并新数据，最后加密
             existing_other = decrypt_config(existing_other, SENSITIVE_OTHER_FIELDS)
             existing_other.update(other_data)  # 使用未加密的新数据合并
             config.other_config = json.dumps(encrypt_config(existing_other, SENSITIVE_OTHER_FIELDS))
-    
+
     await db.commit()
     await db.refresh(config)
-    
+
     # 获取系统默认配置并合并（与 get_my_config 保持一致）
     default_config = get_default_config()
     user_llm_config = json.loads(config.llm_config) if config.llm_config else {}
     user_other_config = json.loads(config.other_config) if config.other_config else {}
-    
+
     # 解密后返回给前端
     user_llm_config = decrypt_config(user_llm_config, SENSITIVE_LLM_FIELDS)
     user_other_config = decrypt_config(user_other_config, SENSITIVE_OTHER_FIELDS)
-    
+
     merged_llm_config = {**default_config["llmConfig"], **user_llm_config}
     merged_other_config = {**default_config["otherConfig"], **user_other_config}
-    
+
     return UserConfigResponse(
         id=config.id,
         user_id=config.user_id,
@@ -358,6 +432,17 @@ async def test_llm_connection(
             "output_language": saved_output_lang,
         },
     }
+
+    # SSRF防护：验证baseUrl是否安全
+    if request.baseUrl and not is_safe_url(request.baseUrl):
+        print(f"[LLM Test] SSRF防护: 拒绝访问内网地址 {request.baseUrl}")
+        debug_info["error_type"] = "ssrf_blocked"
+        debug_info["error_category"] = "security"
+        return LLMTestResponse(
+            success=False,
+            message="不允许访问内网地址，请使用公网API地址",
+            debug=debug_info
+        )
 
     try:
         # 解析provider
